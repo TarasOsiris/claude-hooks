@@ -8,6 +8,8 @@ User-level Claude Code hooks, shared by every machine:
   instruction for the session that sent it, with the replied-to file as context. While the
   session works the reply arrives after the next tool call (`post`); while it is idle a Stop
   hook with `asyncRewake` wakes it (`stop`).
+  The final answer of a turn a reply started goes back to Telegram as a reply to yours; reply
+  to that answer to keep going with the same session.
 
 One bot serves every machine: each machine reads the shared queue without confirming fresh
 messages and takes only replies to messages it sent. See the docstring in `telegram-replies.py`.

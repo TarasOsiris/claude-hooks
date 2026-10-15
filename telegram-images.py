@@ -129,12 +129,15 @@ def remember(message, kind, path, cwd, session):
     """Which session sent the message, and what — so a reply to it reaches that session."""
     if not (message and session):
         return
-    msgmap = json.load(open(MSGMAP)) if os.path.exists(MSGMAP) else {}
-    msgmap[str(message["message_id"])] = {"session": session, "path": path, "kind": kind,
-                                          "cwd": cwd, "at": time.time()}
-    if len(msgmap) > 5000:
-        msgmap = dict(list(msgmap.items())[-2000:])
-    json.dump(msgmap, open(MSGMAP, "w"))
+    # Shared with telegram-replies.py, which records the answers it sends.
+    with open(MSGMAP + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        msgmap = json.load(open(MSGMAP)) if os.path.exists(MSGMAP) else {}
+        msgmap[str(message["message_id"])] = {"session": session, "path": path, "kind": kind,
+                                              "cwd": cwd, "at": time.time()}
+        if len(msgmap) > 5000:
+            msgmap = dict(list(msgmap.items())[-2000:])
+        json.dump(msgmap, open(MSGMAP, "w"))
 
 
 def worker(cwd, session=""):

@@ -23,6 +23,10 @@ the reply is downloaded beside the inbox. The inbox is delivered by:
          WAIT_HOURS, or once Claude Code has exited.
   poll   one short poll (what `post` detaches).
 
+When a turn was started by a reply, its final answer (the Stop hook's last_assistant_message)
+goes back to Telegram as a reply to yours, and is recorded like any sent file, so replying to the
+answer keeps the conversation going with the same session.
+
 Anything that is not a reply from the configured chat to a message this machine sent is left
 alone. State and log: ~/.claude/hooks/telegram-images/.
 """
@@ -38,6 +42,7 @@ ATTACHMENTS = os.path.join(STATE, "attachments")
 LOG = os.path.join(STATE, "log.txt")
 POLL_LOCK = os.path.join(STATE, "poll.lock")
 HANDLED = os.path.join(STATE, "handled-updates.json")
+ANSWER_LIMIT = 4000  # Telegram's message limit is 4096
 WAIT_HOURS = 4
 POLL_SECONDS = 5
 CONFIRM_AFTER_HOURS = 6
@@ -90,7 +95,7 @@ def route(update, chat, msgmap):
         return None
     return target["session"], {
         "text": text,
-        "replying_to": {k: target[k] for k in ("path", "kind", "cwd") if target.get(k)},
+        "replying_to": {k: target[k] for k in ("path", "kind", "cwd", "excerpt") if target.get(k)},
         "file_id": attachment_id(msg),
         "message_id": msg.get("message_id"),
         "at": msg.get("date"),
@@ -189,12 +194,67 @@ def render(entries):
         if about.get("path"):
             lines.append(f"  Replying to the {about.get('kind', 'file')} {about['path']}"
                          " (open it to see what they mean).")
+        elif about.get("excerpt"):
+            lines.append(f"  Replying to this session's earlier answer: {about['excerpt']}")
         if e.get("attachment"):
             lines.append(f"  They attached: {e['attachment']}")
     return "\n".join(lines)
 
 
-def stop(session):
+def answer_path(session):
+    return inbox_path(session).replace(".jsonl", ".answer.json")
+
+
+def deliver(session, entries):
+    """The replies as Claude's context, remembering which Telegram messages the turn answers."""
+    pending = load(answer_path(session), []) + [e["message_id"] for e in entries if e.get("message_id")]
+    with open(answer_path(session), "w") as fh:
+        json.dump(pending, fh)
+    return render(entries)
+
+
+def remember(message_id, entry):
+    with open(MSGMAP + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        msgmap = load(MSGMAP, {})
+        msgmap[str(message_id)] = entry
+        if len(msgmap) > 5000:
+            msgmap = dict(list(msgmap.items())[-2000:])
+        with open(MSGMAP, "w") as fh:
+            json.dump(msgmap, fh)
+
+
+def answer(session, text):
+    """Sends the turn's final message back as a reply to the Telegram message that started it."""
+    pending = load(answer_path(session), [])
+    if not pending:
+        return
+    os.remove(answer_path(session))
+    text = (text or "").strip()
+    if not text:
+        return
+    if len(text) > ANSWER_LIMIT:
+        text = text[:ANSWER_LIMIT - 1] + "…"
+    token, chat = creds()
+    body = urllib.parse.urlencode({
+        "chat_id": chat, "text": text,
+        "reply_parameters": json.dumps({"message_id": pending[-1], "allow_sending_without_reply": True}),
+    }).encode()
+    try:
+        with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=body,
+                                    timeout=30) as resp:
+            sent = json.load(resp).get("result") or {}
+    except Exception as e:
+        log(f"answer to {pending[-1]} failed: {e}")
+        return
+    excerpt = text if len(text) <= 300 else text[:299] + "…"
+    remember(sent.get("message_id"), {"session": session, "kind": "answer", "excerpt": excerpt,
+                                      "at": time.time()})
+    log(f"answered reply {pending[-1]} for session {session}")
+
+
+def stop(session, last_message):
+    answer(session, last_message)
     # One waiter per session: a later turn's Stop finds the earlier waiter still listening.
     os.makedirs(INBOX, exist_ok=True)
     lock = open(os.path.join(INBOX, f".{os.path.basename(inbox_path(session))}.waiter"), "w")
@@ -208,7 +268,7 @@ def stop(session):
             return 0
         entries = take(session)
         if entries:
-            sys.stderr.write(render(entries) + "\n")
+            sys.stderr.write(deliver(session, entries) + "\n")
             return 2
         poll()
         time.sleep(POLL_SECONDS)
@@ -221,7 +281,7 @@ def post(session):
     entries = take(session)
     if entries:
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse",
-                                                 "additionalContext": render(entries)}}))
+                                                 "additionalContext": deliver(session, entries)}}))
     return 0
 
 
@@ -232,13 +292,14 @@ def main():
         poll()
         return 0
     try:
-        session = json.load(sys.stdin).get("session_id") or ""
+        event = json.load(sys.stdin)
     except Exception:
-        session = ""
+        event = {}
+    session = event.get("session_id") or ""
     if not session:
         return 0
     if mode == "stop":
-        return stop(session)
+        return stop(session, event.get("last_assistant_message"))
     if mode == "post":
         return post(session)
     return 0
